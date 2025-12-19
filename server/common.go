@@ -124,16 +124,16 @@ var execCWRequest = executeCodeWhispererRequest
 
 // buildUserAgentHeaders 构建用户代理请求头
 func buildUserAgentHeaders() map[string]string {
-	// 版本信息
-	sdkVersion := "3.738.0"
-	osVersion := "other"
-	nodeVersion := "unknown_unknown"
-	kiroVersion := "0.2.13"
-	hash := "66c23a8c5d15afabec89ef9954ef52a119f10d369df04d548fc6c1eac694b0d1"
+	// 版本信息（基于真实 Kiro IDE 信息）
+	sdkVersion := "1.0.18"                                                           // AWS SDK 版本（保持原始值）
+	osVersion := "13.8.258.32-electron.0"                                            // OS: 13.8.258.32-electron.0
+	nodeVersion := "138.0.7204.251"                                                  // Node.js: 138.0.7204.251
+	kiroVersion := "0.8.0"                                                           // Kiro IDE 版本: 0.8.0
+	hash := "ff5b0b54a4bf5780b759a0cf91b16350f8f1fd95"                               // Git 提交哈希
 
 	return map[string]string{
 		// vibe 快速助探和测试
-		"x-amzn-kiro-agent-mode": "spec",
+		"x-amzn-kiro-agent-mode": "vibe",
 		"x-amz-user-agent": fmt.Sprintf(
 			"aws-sdk-js/%s KiroIDE-%s-%s",
 			sdkVersion, kiroVersion, hash,
