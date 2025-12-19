@@ -2,8 +2,10 @@ package server
 
 import (
 	"bytes"
+	"crypto/rand"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"strings"
 
@@ -122,18 +124,68 @@ func executeCodeWhispererRequest(c *gin.Context, anthropicReq types.AnthropicReq
 // execCWRequest 供测试覆盖的请求执行入口（可在测试中替换）
 var execCWRequest = executeCodeWhispererRequest
 
-// buildUserAgentHeaders 构建用户代理请求头
+// randomInt 生成指定范围内的随机整数
+func randomInt(min, max int) int {
+	if min >= max {
+		return min
+	}
+	n, err := rand.Int(rand.Reader, big.NewInt(int64(max-min+1)))
+	if err != nil {
+		// 降级为固定值（罕见情况）
+		return min
+	}
+	return int(n.Int64()) + min
+}
+
+// generateRandomGitHash 生成随机 Git 提交哈希（40字符十六进制）
+func generateRandomGitHash() string {
+	const hexChars = "0123456789abcdef"
+	hash := make([]byte, 40)
+	for i := range hash {
+		n, err := rand.Int(rand.Reader, big.NewInt(16))
+		if err != nil {
+			// 降级为固定字符
+			hash[i] = '0'
+			continue
+		}
+		hash[i] = hexChars[n.Int64()]
+	}
+	return string(hash)
+}
+
+// generateRandomOSVersion 生成随机 OS 版本（模拟不同的 Electron 环境）
+// 范围: 13.7.x.x-electron.0 ~ 13.9.x.x-electron.0
+func generateRandomOSVersion() string {
+	major := 13
+	minor := randomInt(7, 9)        // 7-9
+	patch := randomInt(0, 99)       // 0-99
+	build := randomInt(0, 299)      // 0-299
+	return fmt.Sprintf("%d.%d.%d.%d-electron.0", major, minor, patch, build)
+}
+
+// generateRandomNodeVersion 生成随机 Node/Chromium 版本
+// 范围: 138.0.7200.x ~ 138.0.7210.x
+func generateRandomNodeVersion() string {
+	major := 138
+	minor := 0
+	patch := randomInt(7200, 7210)  // 7200-7210
+	build := randomInt(0, 999)      // 0-999
+	return fmt.Sprintf("%d.%d.%d.%d", major, minor, patch, build)
+}
+
+// buildUserAgentHeaders 构建用户代理请求头（保守随机化策略）
 func buildUserAgentHeaders() map[string]string {
-	// 版本信息（基于真实 Kiro IDE 信息）
-	sdkVersion := "1.0.18"                                                           // AWS SDK 版本（保持原始值）
-	osVersion := "13.8.258.32-electron.0"                                            // OS: 13.8.258.32-electron.0
-	nodeVersion := "138.0.7204.251"                                                  // Node.js: 138.0.7204.251
-	kiroVersion := "0.8.0"                                                           // Kiro IDE 版本: 0.8.0
-	hash := "ff5b0b54a4bf5780b759a0cf91b16350f8f1fd95"                               // Git 提交哈希
+	// 固定版本（保持稳定）
+	sdkVersion := "1.0.18"          // AWS SDK 版本（固定）
+	kiroVersion := "0.8.0"          // Kiro IDE 版本（固定）
+
+	// 随机版本（模拟不同用户环境，降低被识别为同一客户端的风险）
+	osVersion := generateRandomOSVersion()      // 随机 Electron 版本
+	nodeVersion := generateRandomNodeVersion()  // 随机 Chromium 版本
+	hash := generateRandomGitHash()             // 随机 Git 哈希
 
 	return map[string]string{
-		// vibe 快速助探和测试
-		"x-amzn-kiro-agent-mode": "vibe",
+		"x-amzn-kiro-agent-mode": "spec",
 		"x-amz-user-agent": fmt.Sprintf(
 			"aws-sdk-js/%s KiroIDE-%s-%s",
 			sdkVersion, kiroVersion, hash,
