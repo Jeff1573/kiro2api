@@ -122,6 +122,29 @@ func executeCodeWhispererRequest(c *gin.Context, anthropicReq types.AnthropicReq
 // execCWRequest 供测试覆盖的请求执行入口（可在测试中替换）
 var execCWRequest = executeCodeWhispererRequest
 
+// buildUserAgentHeaders 构建用户代理请求头
+func buildUserAgentHeaders() map[string]string {
+	// 版本信息
+	sdkVersion := "3.738.0"
+	osVersion := "other"
+	nodeVersion := "unknown_unknown"
+	kiroVersion := "0.2.13"
+	hash := "66c23a8c5d15afabec89ef9954ef52a119f10d369df04d548fc6c1eac694b0d1"
+
+	return map[string]string{
+		// vibe 快速助探和测试
+		"x-amzn-kiro-agent-mode": "spec",
+		"x-amz-user-agent": fmt.Sprintf(
+			"aws-sdk-js/%s KiroIDE-%s-%s",
+			sdkVersion, kiroVersion, hash,
+		),
+		"user-agent": fmt.Sprintf(
+			"aws-sdk-js/%s ua/2.1 os/%s lang/js md/nodejs#%s api/codewhispererstreaming#%s m/E KiroIDE-%s-%s",
+			sdkVersion, osVersion, nodeVersion, sdkVersion, kiroVersion, hash,
+		),
+	}
+}
+
 // buildCodeWhispererRequest 构建通用的CodeWhisperer请求
 func buildCodeWhispererRequest(c *gin.Context, anthropicReq types.AnthropicRequest, tokenInfo types.TokenInfo, isStream bool) (*http.Request, error) {
 	cwReq, err := converter.BuildCodeWhispererRequest(anthropicReq, c)
@@ -172,9 +195,10 @@ func buildCodeWhispererRequest(c *gin.Context, anthropicReq types.AnthropicReque
 	}
 
 	// 添加上游请求必需的header
-	req.Header.Set("x-amzn-kiro-agent-mode", "spec")
-	req.Header.Set("x-amz-user-agent", "aws-sdk-js/1.0.18 KiroIDE-0.2.13-66c23a8c5d15afabec89ef9954ef52a119f10d369df04d548fc6c1eac694b0d1")
-	req.Header.Set("user-agent", "aws-sdk-js/1.0.18 ua/2.1 os/darwin#25.0.0 lang/js md/nodejs#20.16.0 api/codewhispererstreaming#1.0.18 m/E KiroIDE-0.2.13-66c23a8c5d15afabec89ef9954ef52a119f10d369df04d548fc6c1eac694b0d1")
+	headers := buildUserAgentHeaders()
+	for key, value := range headers {
+		req.Header.Set(key, value)
+	}
 
 	return req, nil
 }
