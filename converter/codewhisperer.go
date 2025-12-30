@@ -345,11 +345,17 @@ func BuildCodeWhispererRequest(anthropicReq types.AnthropicRequest, ctx *gin.Con
 	}
 
 	// 构建历史消息
-	if len(anthropicReq.System) > 0 || len(anthropicReq.Messages) > 1 || len(anthropicReq.Tools) > 0 {
+	if len(anthropicReq.System) > 0 || len(anthropicReq.Messages) > 1 || len(anthropicReq.Tools) > 0 || isThinkingEnabled(anthropicReq) {
 		var history []any
 
 		// 构建综合系统提示
 		var systemContentBuilder strings.Builder
+
+		// 注入 thinking 标签（如果启用）
+		if thinkingPrefix := buildThinkingPrefix(anthropicReq); thinkingPrefix != "" {
+			systemContentBuilder.WriteString(thinkingPrefix)
+			systemContentBuilder.WriteString("\n")
+		}
 
 		// 添加原有的 system 消息
 		if len(anthropicReq.System) > 0 {
@@ -607,4 +613,33 @@ func extractToolUsesFromMessage(content any) []types.ToolUseEntry {
 	}
 
 	return toolUses
+}
+
+// ============ Extended Thinking 处理 ============
+
+// isThinkingEnabled 检查是否启用了 Extended Thinking
+func isThinkingEnabled(req types.AnthropicRequest) bool {
+	return req.Thinking != nil && req.Thinking.Type == "enabled"
+}
+
+// buildThinkingPrefix 构建 thinking 标签前缀
+// 返回格式: <thinking_mode>enabled</thinking_mode><max_thinking_length>20000</max_thinking_length>
+func buildThinkingPrefix(req types.AnthropicRequest) string {
+	if !isThinkingEnabled(req) {
+		return ""
+	}
+
+	budgetTokens := req.Thinking.BudgetTokens
+	// 应用默认值和上限
+	if budgetTokens <= 0 {
+		budgetTokens = config.ThinkingDefaultBudgetTokens
+	}
+	if budgetTokens > config.ThinkingMaxBudgetTokens {
+		budgetTokens = config.ThinkingMaxBudgetTokens
+	}
+
+	return fmt.Sprintf("%s%s",
+		config.ThinkingModeTag,
+		fmt.Sprintf(config.ThinkingLengthTagFormat, budgetTokens),
+	)
 }

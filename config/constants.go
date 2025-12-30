@@ -50,3 +50,25 @@ const (
 	// 用于工具调用参数的JSON内容token估算
 	TokenEstimationRatio = 4
 )
+
+// Extended Thinking 常量
+const (
+	// ThinkingDefaultBudgetTokens 默认 thinking 预算 token 数
+	ThinkingDefaultBudgetTokens = 20000
+
+	// ThinkingMaxBudgetTokens 最大 thinking 预算 token 数
+	// 参考 kiro.rs 实现，与 Anthropic API 限制保持一致
+	ThinkingMaxBudgetTokens = 24576
+
+	// ThinkingTagOpen thinking 块开始标签
+	ThinkingTagOpen = "<thinking>"
+
+	// ThinkingTagClose thinking 块结束标签
+	ThinkingTagClose = "</thinking>"
+
+	// ThinkingModeTag thinking 模式标签（注入到系统消息）
+	ThinkingModeTag = "<thinking_mode>enabled</thinking_mode>"
+
+	// ThinkingLengthTagFormat thinking 长度标签格式
+	ThinkingLengthTagFormat = "<max_thinking_length>%d</max_thinking_length>"
+)
