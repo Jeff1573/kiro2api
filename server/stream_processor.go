@@ -5,7 +5,6 @@ import (
 	"io"
 	"strings"
 
-	"kiro2api/config"
 	"kiro2api/logger"
 	"kiro2api/parser"
 	"kiro2api/types"
@@ -47,14 +46,6 @@ type StreamProcessorContext struct {
 	// 问题：每个 input_json_delta 单独计算 len(partialJSON)/4 会导致小于4字节的分段被舍弃
 	// 解决：累加每个块的JSON字节数，在 content_block_stop 时一次性计算 token
 	jsonBytesByBlockIndex map[int]int // 每个工具块累积的JSON字节数
-
-	// ============ Extended Thinking 状态 ============
-	thinkingEnabled   bool   // 是否启用 thinking
-	thinkingBuffer    string // thinking 内容缓冲区
-	inThinkingBlock   bool   // 是否在 thinking 块内
-	thinkingExtracted bool   // thinking 块是否已提取完成
-	thinkingBlockIdx  int    // thinking 块索引（-1 表示未创建）
-	textBlockIdx      int    // 文本块索引（thinking 启用时动态分配，-1 表示未创建）
 }
 
 // NewStreamProcessorContext 创建流处理上下文
@@ -66,9 +57,6 @@ func NewStreamProcessorContext(
 	messageID string,
 	inputTokens int,
 ) *StreamProcessorContext {
-	// 检查是否启用 thinking
-	thinkingEnabled := req.Thinking != nil && req.Thinking.Type == "enabled"
-
 	return &StreamProcessorContext{
 		c:                     c,
 		req:                   req,
@@ -76,20 +64,13 @@ func NewStreamProcessorContext(
 		sender:                sender,
 		messageID:             messageID,
 		inputTokens:           inputTokens,
-		sseStateManager:       NewSSEStateManager(false), // strictMode=false，非严格模式
+		sseStateManager:       NewSSEStateManager(false),
 		stopReasonManager:     NewStopReasonManager(req),
 		tokenEstimator:        utils.NewTokenEstimator(),
 		compliantParser:       parser.NewCompliantEventStreamParser(),
 		toolUseIdByBlockIndex: make(map[int]string),
 		completedToolUseIds:   make(map[string]bool),
-		jsonBytesByBlockIndex: make(map[int]int),
-		// thinking 状态初始化
-		thinkingEnabled:   thinkingEnabled,
-		thinkingBuffer:    "",
-		inThinkingBlock:   false,
-		thinkingExtracted: false,
-		thinkingBlockIdx:  -1,
-		textBlockIdx:      -1,
+		jsonBytesByBlockIndex: make(map[int]int), // *** 初始化JSON字节累加器 ***
 	}
 }
 
@@ -385,19 +366,7 @@ func (esp *EventStreamProcessor) ProcessEventStream(reader io.Reader) error {
 		}
 	}
 
-	// 刷新 thinking 缓冲区中的剩余内容
-	if esp.ctx.thinkingEnabled {
-		flushEvents := esp.ctx.flushThinkingBuffer()
-		for _, evt := range flushEvents {
-			if err := esp.ctx.sseStateManager.SendEvent(esp.ctx.c, esp.ctx.sender, evt); err != nil {
-				logger.Error("刷新 thinking 缓冲区失败", logger.Err(err))
-			}
-		}
-		if len(flushEvents) > 0 {
-			esp.ctx.c.Writer.Flush()
-		}
-	}
-
+	// 直传模式：无需冲刷剩余文本
 	return nil
 }
 
@@ -410,54 +379,6 @@ func (esp *EventStreamProcessor) processEvent(event parser.SSEEvent) error {
 	}
 
 	eventType, _ := dataMap["type"].(string)
-
-	// ============ Extended Thinking 拦截处理 ============
-	// 当启用 thinking 时，需要拦截上游文本块的所有事件（start/delta/stop）
-	// 原因：thinking 逻辑会自己创建和管理块，上游的块事件会导致状态冲突
-	if esp.ctx.thinkingEnabled {
-		switch eventType {
-		case "content_block_start":
-			// 拦截上游文本块的 start 事件，只放行工具块
-			if contentBlock, ok := dataMap["content_block"].(map[string]any); ok {
-				blockType, _ := contentBlock["type"].(string)
-				if blockType == "text" {
-					// 文本块由 thinking 逻辑自己创建，跳过上游的 start
-					logger.Debug("thinking 模式：拦截上游文本块 start 事件")
-					return nil
-				}
-			}
-
-		case "content_block_delta":
-			if delta, ok := dataMap["delta"].(map[string]any); ok {
-				deltaType, _ := delta["type"].(string)
-				if deltaType == "text_delta" {
-					// 拦截 text_delta，使用 thinking 处理逻辑
-					if text, ok := delta["text"].(string); ok && text != "" {
-						events := esp.ctx.processThinkingContent(text)
-						for _, evt := range events {
-							if err := esp.ctx.sseStateManager.SendEvent(esp.ctx.c, esp.ctx.sender, evt); err != nil {
-								logger.Error("发送 thinking 事件失败", logger.Err(err))
-							}
-						}
-						esp.ctx.c.Writer.Flush()
-					}
-					return nil // 已处理，不转发原始事件
-				}
-			}
-
-		case "content_block_stop":
-			// 拦截上游文本块的 stop 事件
-			// 检查这个 index 是否是上游的文本块（index 0 通常是上游文本块）
-			index := extractIndex(dataMap)
-			// 如果这个 index 不在我们管理的块中，说明是上游的块，跳过
-			block, exists := esp.ctx.sseStateManager.GetActiveBlocks()[index]
-			if !exists || (block != nil && block.Type == "text" && index == 0 && esp.ctx.textBlockIdx != 0) {
-				// 上游的文本块 stop 事件，跳过
-				logger.Debug("thinking 模式：拦截上游文本块 stop 事件", logger.Int("index", index))
-				return nil
-			}
-		}
-	}
 
 	// 处理不同类型的事件
 	switch eventType {
@@ -613,287 +534,3 @@ func (esp *EventStreamProcessor) handleExceptionEvent(dataMap map[string]any) bo
 }
 
 // 直传模式：无flush逻辑
-
-// ============ Extended Thinking 处理 ============
-
-// quoteChars 引用字符列表，被这些字符包裹的标签会被跳过
-// 与 kiro.rs 实现对齐，包含所有可能的引用/特殊字符
-var quoteChars = []byte{
-	'`', '"', '\'', '\\', '#', '!', '@', '$', '%', '^', '&', '*', '(', ')', '-',
-	'_', '=', '+', '[', ']', '{', '}', ';', ':', '<', '>', ',', '.', '?', '/',
-}
-
-// findCharBoundary 找到小于等于目标位置的最近有效 UTF-8 字符边界
-// UTF-8 字符可能占用 1-4 个字节，直接按字节位置切片可能会切在多字节字符中间导致乱码
-func findCharBoundary(s string, target int) int {
-	if target >= len(s) {
-		return len(s)
-	}
-	if target <= 0 {
-		return 0
-	}
-	// 从目标位置向前搜索有效的字符边界
-	// UTF-8 续字节的格式是 10xxxxxx（最高两位是 10）
-	// 起始字节的格式是 0xxxxxxx 或 11xxxxxx
-	pos := target
-	for pos > 0 && (s[pos]&0xC0) == 0x80 {
-		pos--
-	}
-	return pos
-}
-
-// isQuoteChar 检查指定位置的字符是否是引用字符
-func isQuoteChar(buffer string, pos int) bool {
-	if pos < 0 || pos >= len(buffer) {
-		return false
-	}
-	b := buffer[pos]
-	for _, q := range quoteChars {
-		if b == q {
-			return true
-		}
-	}
-	return false
-}
-
-// findRealThinkingStartTag 查找真正的 thinking 开始标签（不被引用字符包裹）
-func findRealThinkingStartTag(buffer string) int {
-	tag := config.ThinkingTagOpen
-	searchStart := 0
-
-	for {
-		pos := strings.Index(buffer[searchStart:], tag)
-		if pos == -1 {
-			return -1
-		}
-		absolutePos := searchStart + pos
-
-		// 检查前后是否有引用字符
-		hasQuoteBefore := absolutePos > 0 && isQuoteChar(buffer, absolutePos-1)
-		afterPos := absolutePos + len(tag)
-		hasQuoteAfter := isQuoteChar(buffer, afterPos)
-
-		if !hasQuoteBefore && !hasQuoteAfter {
-			return absolutePos
-		}
-
-		searchStart = absolutePos + 1
-	}
-}
-
-// findRealThinkingEndTag 查找真正的 thinking 结束标签（不被引用字符包裹，且后面有双换行符）
-func findRealThinkingEndTag(buffer string) int {
-	tag := config.ThinkingTagClose
-	searchStart := 0
-
-	for {
-		pos := strings.Index(buffer[searchStart:], tag)
-		if pos == -1 {
-			return -1
-		}
-		absolutePos := searchStart + pos
-
-		// 检查前后是否有引用字符
-		hasQuoteBefore := absolutePos > 0 && isQuoteChar(buffer, absolutePos-1)
-		afterPos := absolutePos + len(tag)
-		hasQuoteAfter := isQuoteChar(buffer, afterPos)
-
-		if hasQuoteBefore || hasQuoteAfter {
-			searchStart = absolutePos + 1
-			continue
-		}
-
-		// 检查后面的内容
-		afterContent := buffer[afterPos:]
-		if len(afterContent) < 2 {
-			return -1 // 等待更多内容（需要至少2字节判断双换行符）
-		}
-
-		// 真正的结束标签后面会有双换行符 `\n\n`（与 kiro.rs 对齐）
-		if strings.HasPrefix(afterContent, "\n\n") {
-			return absolutePos
-		}
-
-		searchStart = absolutePos + 1
-	}
-}
-
-// processThinkingContent 处理包含 thinking 块的内容
-// 返回需要发送的事件列表
-func (ctx *StreamProcessorContext) processThinkingContent(text string) []map[string]any {
-	var events []map[string]any
-
-	// 将内容添加到缓冲区
-	ctx.thinkingBuffer += text
-
-	for {
-		if !ctx.inThinkingBlock && !ctx.thinkingExtracted {
-			// 查找 <thinking> 开始标签
-			startPos := findRealThinkingStartTag(ctx.thinkingBuffer)
-			if startPos != -1 {
-				// 发送 <thinking> 之前的内容作为 text_delta
-				beforeThinking := ctx.thinkingBuffer[:startPos]
-				if beforeThinking != "" {
-					events = append(events, ctx.createTextDeltaEvents(beforeThinking)...)
-				}
-
-				// 进入 thinking 块
-				ctx.inThinkingBlock = true
-				ctx.thinkingBuffer = ctx.thinkingBuffer[startPos+len(config.ThinkingTagOpen):]
-
-				// 创建 thinking 块的 content_block_start 事件
-				ctx.thinkingBlockIdx = ctx.sseStateManager.GetNextBlockIndex()
-				events = append(events, map[string]any{
-					"type":  "content_block_start",
-					"index": ctx.thinkingBlockIdx,
-					"content_block": map[string]any{
-						"type":     "thinking",
-						"thinking": "",
-					},
-				})
-			} else {
-				// 没有找到 <thinking>，保留可能是部分标签的内容
-				targetLen := len(ctx.thinkingBuffer) - len(config.ThinkingTagOpen)
-				safeLen := findCharBoundary(ctx.thinkingBuffer, targetLen)
-				if safeLen > 0 {
-					safeContent := ctx.thinkingBuffer[:safeLen]
-					if safeContent != "" {
-						events = append(events, ctx.createTextDeltaEvents(safeContent)...)
-					}
-					ctx.thinkingBuffer = ctx.thinkingBuffer[safeLen:]
-				}
-				break
-			}
-		} else if ctx.inThinkingBlock {
-			// 在 thinking 块内，查找 </thinking> 结束标签
-			endPos := findRealThinkingEndTag(ctx.thinkingBuffer)
-			if endPos != -1 {
-				// 提取 thinking 内容
-				thinkingContent := ctx.thinkingBuffer[:endPos]
-				if thinkingContent != "" {
-					events = append(events, ctx.createThinkingDeltaEvent(thinkingContent))
-					// 累计 thinking token
-					ctx.totalOutputTokens += ctx.tokenEstimator.EstimateTextTokens(thinkingContent)
-				}
-
-				// 结束 thinking 块
-				ctx.inThinkingBlock = false
-				ctx.thinkingExtracted = true
-
-				// 发送空的 thinking_delta 和 content_block_stop
-				events = append(events, ctx.createThinkingDeltaEvent(""))
-				events = append(events, map[string]any{
-					"type":  "content_block_stop",
-					"index": ctx.thinkingBlockIdx,
-				})
-
-				ctx.thinkingBuffer = ctx.thinkingBuffer[endPos+len(config.ThinkingTagClose):]
-				// 跳过结束标签后的换行符
-				ctx.thinkingBuffer = strings.TrimPrefix(ctx.thinkingBuffer, "\n\n")
-			} else {
-				// 没有找到结束标签，发送当前缓冲区内容作为 thinking_delta
-				targetLen := len(ctx.thinkingBuffer) - len(config.ThinkingTagClose)
-				safeLen := findCharBoundary(ctx.thinkingBuffer, targetLen)
-				if safeLen > 0 {
-					safeContent := ctx.thinkingBuffer[:safeLen]
-					if safeContent != "" {
-						events = append(events, ctx.createThinkingDeltaEvent(safeContent))
-						ctx.totalOutputTokens += ctx.tokenEstimator.EstimateTextTokens(safeContent)
-					}
-					ctx.thinkingBuffer = ctx.thinkingBuffer[safeLen:]
-				}
-				break
-			}
-		} else {
-			// thinking 已提取完成，剩余内容作为 text_delta
-			if ctx.thinkingBuffer != "" {
-				remaining := ctx.thinkingBuffer
-				ctx.thinkingBuffer = ""
-				events = append(events, ctx.createTextDeltaEvents(remaining)...)
-			}
-			break
-		}
-	}
-
-	return events
-}
-
-// createTextDeltaEvents 创建 text_delta 事件
-func (ctx *StreamProcessorContext) createTextDeltaEvents(text string) []map[string]any {
-	var events []map[string]any
-
-	// 如果文本块尚未创建，先创建
-	if ctx.textBlockIdx == -1 {
-		ctx.textBlockIdx = ctx.sseStateManager.GetNextBlockIndex()
-		events = append(events, map[string]any{
-			"type":  "content_block_start",
-			"index": ctx.textBlockIdx,
-			"content_block": map[string]any{
-				"type": "text",
-				"text": "",
-			},
-		})
-	}
-
-	// 发送 text_delta 事件
-	events = append(events, map[string]any{
-		"type":  "content_block_delta",
-		"index": ctx.textBlockIdx,
-		"delta": map[string]any{
-			"type": "text_delta",
-			"text": text,
-		},
-	})
-
-	// 累计 token
-	ctx.totalOutputTokens += ctx.tokenEstimator.EstimateTextTokens(text)
-
-	return events
-}
-
-// createThinkingDeltaEvent 创建 thinking_delta 事件
-func (ctx *StreamProcessorContext) createThinkingDeltaEvent(thinking string) map[string]any {
-	return map[string]any{
-		"type":  "content_block_delta",
-		"index": ctx.thinkingBlockIdx,
-		"delta": map[string]any{
-			"type":     "thinking_delta",
-			"thinking": thinking,
-		},
-	}
-}
-
-// flushThinkingBuffer 刷新 thinking 缓冲区中的剩余内容
-func (ctx *StreamProcessorContext) flushThinkingBuffer() []map[string]any {
-	var events []map[string]any
-
-	if !ctx.thinkingEnabled || ctx.thinkingBuffer == "" {
-		return events
-	}
-
-	if ctx.inThinkingBlock {
-		// 如果还在 thinking 块内，发送剩余内容作为 thinking_delta
-		events = append(events, ctx.createThinkingDeltaEvent(ctx.thinkingBuffer))
-		ctx.totalOutputTokens += ctx.tokenEstimator.EstimateTextTokens(ctx.thinkingBuffer)
-
-		// 关闭 thinking 块
-		events = append(events, ctx.createThinkingDeltaEvent(""))
-		events = append(events, map[string]any{
-			"type":  "content_block_stop",
-			"index": ctx.thinkingBlockIdx,
-		})
-	} else {
-		// 否则发送剩余内容作为 text_delta
-		events = append(events, ctx.createTextDeltaEvents(ctx.thinkingBuffer)...)
-		// 关闭 text 块
-		if ctx.textBlockIdx != -1 {
-			events = append(events, map[string]any{
-				"type":  "content_block_stop",
-				"index": ctx.textBlockIdx,
-			})
-		}
-	}
-
-	ctx.thinkingBuffer = ""
-	return events
-}

@@ -6,6 +6,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 高性能 AI API 代理服务器，桥接 Anthropic/OpenAI API 与 AWS CodeWhisperer。支持流式响应、工具调用、多账号池管理。
 
+## 代码探索规范
+
+**⚠️ 强制要求：优先使用 Serena MCP 工具进行代码探索和编辑**
+
+- **代码探索**: 使用 `mcp__serena__get_symbols_overview` 获取文件概览，然后使用 `mcp__serena__find_symbol` 精确读取符号
+- **代码搜索**: 使用 `mcp__serena__search_for_pattern` 进行模式搜索
+- **代码编辑**: 使用 `mcp__serena__replace_symbol_body`、`insert_after_symbol`、`insert_before_symbol` 进行符号级编辑
+- **依赖分析**: 使用 `mcp__serena__find_referencing_symbols` 查找引用关系
+
 **禁止**: 直接使用 `Read` 工具读取整个 Go 源代码文件，除非是配置文件（`.json`、`.yaml`、`.env`）或文档文件（`.md`）。
 
 ## 开发命令

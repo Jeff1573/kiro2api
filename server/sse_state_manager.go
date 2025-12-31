@@ -415,10 +415,3 @@ func (ssm *SSEStateManager) IsMessageEnded() bool {
 func (ssm *SSEStateManager) IsMessageDeltaSent() bool {
 	return ssm.messageDeltaSent
 }
-
-// GetNextBlockIndex 获取下一个可用的块索引
-func (ssm *SSEStateManager) GetNextBlockIndex() int {
-	index := ssm.nextBlockIndex
-	ssm.nextBlockIndex++
-	return index
-}
