@@ -444,9 +444,6 @@ async fn handle_non_stream_request(
 
     content.extend(tool_uses);
 
-    // 估算输出 tokens
-    let output_tokens = token::estimate_output_tokens(&content);
-
     // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
     let final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
 

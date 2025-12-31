@@ -39,15 +39,11 @@ impl TokenManager {
 
     /// 确保获取有效的访问 Token
     ///
-    /// 如果 Token 过期或即将过期，会自动刷新
+    /// 如果 Token 在 10 分钟内过期，会自动刷新
     pub async fn ensure_valid_token(&mut self) -> anyhow::Result<String> {
-        if is_token_expired(&self.credentials) || is_token_expiring_soon(&self.credentials) {
+        if should_refresh_token(&self.credentials) {
+            tracing::debug!("Token 即将过期，正在刷新...");
             self.credentials = refresh_token(&self.credentials, &self.config).await?;
-
-            // 刷新后再次检查 token 时间有效性
-            if is_token_expired(&self.credentials) {
-                anyhow::bail!("刷新后的 Token 仍然无效或已过期");
-            }
         }
 
         self.credentials
@@ -55,25 +51,34 @@ impl TokenManager {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("没有可用的 accessToken"))
     }
+
+    /// 强制刷新 Token
+    ///
+    /// 不检查过期时间，直接刷新 Token
+    /// 用于认证失败时的重试场景
+    pub async fn force_refresh_token(&mut self) -> anyhow::Result<String> {
+        tracing::info!("强制刷新 Token...");
+        self.credentials = refresh_token(&self.credentials, &self.config).await?;
+
+        self.credentials
+            .access_token
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("刷新后仍没有可用的 accessToken"))
+    }
 }
 
-/// 检查 Token 是否在指定时间内过期
-fn is_token_expiring_within(credentials: &KiroCredentials, minutes: i64) -> Option<bool> {
+/// 检查是否需要刷新 Token
+///
+/// 在以下情况返回 true：
+/// - Token 在 10 分钟内过期
+/// - 缺少 expires_at 字段
+fn should_refresh_token(credentials: &KiroCredentials) -> bool {
     credentials
         .expires_at
         .as_ref()
         .and_then(|expires_at| DateTime::parse_from_rfc3339(expires_at).ok())
-        .map(|expires| expires <= Utc::now() + Duration::minutes(minutes))
-}
-
-/// 检查 Token 是否已过期（提前 5 分钟判断）
-fn is_token_expired(credentials: &KiroCredentials) -> bool {
-    is_token_expiring_within(credentials, 5).unwrap_or(true)
-}
-
-/// 检查 Token 是否即将过期（10分钟内）
-fn is_token_expiring_soon(credentials: &KiroCredentials) -> bool {
-    is_token_expiring_within(credentials, 10).unwrap_or(false)
+        .map(|expires| expires <= Utc::now() + Duration::minutes(10))
+        .unwrap_or(true) // 缺少过期时间时，默认需要刷新
 }
 
 /// 验证 refreshToken 的基本有效性
@@ -186,48 +191,40 @@ mod tests {
     }
 
     #[test]
-    fn test_is_token_expired_with_expired_token() {
+    fn test_should_refresh_token_with_expired_token() {
         let mut credentials = KiroCredentials::default();
         credentials.expires_at = Some("2020-01-01T00:00:00Z".to_string());
-        assert!(is_token_expired(&credentials));
+        assert!(should_refresh_token(&credentials));
     }
 
     #[test]
-    fn test_is_token_expired_with_valid_token() {
+    fn test_should_refresh_token_with_valid_token() {
         let mut credentials = KiroCredentials::default();
         let future = Utc::now() + Duration::hours(1);
         credentials.expires_at = Some(future.to_rfc3339());
-        assert!(!is_token_expired(&credentials));
+        assert!(!should_refresh_token(&credentials));
     }
 
     #[test]
-    fn test_is_token_expired_within_5_minutes() {
-        let mut credentials = KiroCredentials::default();
-        let expires = Utc::now() + Duration::minutes(3);
-        credentials.expires_at = Some(expires.to_rfc3339());
-        assert!(is_token_expired(&credentials));
-    }
-
-    #[test]
-    fn test_is_token_expired_no_expires_at() {
-        let credentials = KiroCredentials::default();
-        assert!(is_token_expired(&credentials));
-    }
-
-    #[test]
-    fn test_is_token_expiring_soon_within_10_minutes() {
+    fn test_should_refresh_token_within_10_minutes() {
         let mut credentials = KiroCredentials::default();
         let expires = Utc::now() + Duration::minutes(8);
         credentials.expires_at = Some(expires.to_rfc3339());
-        assert!(is_token_expiring_soon(&credentials));
+        assert!(should_refresh_token(&credentials));
     }
 
     #[test]
-    fn test_is_token_expiring_soon_beyond_10_minutes() {
+    fn test_should_refresh_token_beyond_10_minutes() {
         let mut credentials = KiroCredentials::default();
         let expires = Utc::now() + Duration::minutes(15);
         credentials.expires_at = Some(expires.to_rfc3339());
-        assert!(!is_token_expiring_soon(&credentials));
+        assert!(!should_refresh_token(&credentials));
+    }
+
+    #[test]
+    fn test_should_refresh_token_no_expires_at() {
+        let credentials = KiroCredentials::default();
+        assert!(should_refresh_token(&credentials));
     }
 
     #[test]

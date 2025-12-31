@@ -132,6 +132,7 @@ impl KiroProvider {
     /// # Returns
     /// 返回原始的 HTTP Response，不做解析
     pub async fn call_api(&mut self, request_body: &str) -> anyhow::Result<reqwest::Response> {
+        // 首次尝试：使用自动刷新的 token
         let token = self.token_manager.ensure_valid_token().await?;
         let url = self.base_url();
         let headers = self.build_headers(&token)?;
@@ -142,15 +143,76 @@ impl KiroProvider {
             .headers(headers)
             .body(request_body.to_string())
             .send()
-            .await?;
+            .await;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("API 请求失败: {} {}", status, body);
+        // 处理首次请求结果
+        match response {
+            Ok(resp) if resp.status().is_success() => Ok(resp),
+            Ok(resp) if resp.status() == 401 || resp.status() == 403 => {
+                // 认证失败，尝试强制刷新 token 并重试
+                let status = resp.status();
+                tracing::warn!("认证失败 ({}), 尝试刷新 Token 后重试...", status);
+
+                // 强制刷新 token
+                let new_token = self.token_manager.force_refresh_token().await?;
+                let new_headers = self.build_headers(&new_token)?;
+
+                // 重试请求
+                let retry_response = self
+                    .client
+                    .post(&url)
+                    .headers(new_headers)
+                    .body(request_body.to_string())
+                    .send()
+                    .await?;
+
+                if !retry_response.status().is_success() {
+                    let retry_status = retry_response.status();
+                    let retry_body = retry_response.text().await.unwrap_or_default();
+                    anyhow::bail!("API 请求重试后仍失败: {} {}", retry_status, retry_body);
+                }
+
+                Ok(retry_response)
+            }
+            Ok(resp) => {
+                // 其他错误状态码
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                anyhow::bail!("API 请求失败: {} {}", status, body);
+            }
+            Err(e) => {
+                // 网络错误，尝试刷新 token 后重试一次
+                tracing::warn!("网络请求失败: {}, 尝试刷新 Token 后重试...", e);
+
+                // 强制刷新 token
+                match self.token_manager.force_refresh_token().await {
+                    Ok(new_token) => {
+                        let new_headers = self.build_headers(&new_token)?;
+
+                        // 重试请求
+                        let retry_response = self
+                            .client
+                            .post(&url)
+                            .headers(new_headers)
+                            .body(request_body.to_string())
+                            .send()
+                            .await?;
+
+                        if !retry_response.status().is_success() {
+                            let retry_status = retry_response.status();
+                            let retry_body = retry_response.text().await.unwrap_or_default();
+                            anyhow::bail!("API 请求重试后仍失败: {} {}", retry_status, retry_body);
+                        }
+
+                        Ok(retry_response)
+                    }
+                    Err(refresh_err) => {
+                        // Token 刷新失败，返回原始错误
+                        anyhow::bail!("网络请求失败且 Token 刷新失败: {} (刷新错误: {})", e, refresh_err);
+                    }
+                }
+            }
         }
-
-        Ok(response)
     }
 
     /// 发送流式 API 请求
@@ -164,6 +226,7 @@ impl KiroProvider {
         &mut self,
         request_body: &str,
     ) -> anyhow::Result<reqwest::Response> {
+        // 首次尝试：使用自动刷新的 token
         let token = self.token_manager.ensure_valid_token().await?;
         let url = self.base_url();
         let headers = self.build_headers(&token)?;
@@ -174,15 +237,76 @@ impl KiroProvider {
             .headers(headers)
             .body(request_body.to_string())
             .send()
-            .await?;
+            .await;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("流式 API 请求失败: {} {}", status, body);
+        // 处理首次请求结果
+        match response {
+            Ok(resp) if resp.status().is_success() => Ok(resp),
+            Ok(resp) if resp.status() == 401 || resp.status() == 403 => {
+                // 认证失败，尝试强制刷新 token 并重试
+                let status = resp.status();
+                tracing::warn!("流式请求认证失败 ({}), 尝试刷新 Token 后重试...", status);
+
+                // 强制刷新 token
+                let new_token = self.token_manager.force_refresh_token().await?;
+                let new_headers = self.build_headers(&new_token)?;
+
+                // 重试请求
+                let retry_response = self
+                    .client
+                    .post(&url)
+                    .headers(new_headers)
+                    .body(request_body.to_string())
+                    .send()
+                    .await?;
+
+                if !retry_response.status().is_success() {
+                    let retry_status = retry_response.status();
+                    let retry_body = retry_response.text().await.unwrap_or_default();
+                    anyhow::bail!("流式 API 请求重试后仍失败: {} {}", retry_status, retry_body);
+                }
+
+                Ok(retry_response)
+            }
+            Ok(resp) => {
+                // 其他错误状态码
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                anyhow::bail!("流式 API 请求失败: {} {}", status, body);
+            }
+            Err(e) => {
+                // 网络错误，尝试刷新 token 后重试一次
+                tracing::warn!("流式请求网络失败: {}, 尝试刷新 Token 后重试...", e);
+
+                // 强制刷新 token
+                match self.token_manager.force_refresh_token().await {
+                    Ok(new_token) => {
+                        let new_headers = self.build_headers(&new_token)?;
+
+                        // 重试请求
+                        let retry_response = self
+                            .client
+                            .post(&url)
+                            .headers(new_headers)
+                            .body(request_body.to_string())
+                            .send()
+                            .await?;
+
+                        if !retry_response.status().is_success() {
+                            let retry_status = retry_response.status();
+                            let retry_body = retry_response.text().await.unwrap_or_default();
+                            anyhow::bail!("流式 API 请求重试后仍失败: {} {}", retry_status, retry_body);
+                        }
+
+                        Ok(retry_response)
+                    }
+                    Err(refresh_err) => {
+                        // Token 刷新失败，返回原始错误
+                        anyhow::bail!("流式请求失败且 Token 刷新失败: {} (刷新错误: {})", e, refresh_err);
+                    }
+                }
+            }
         }
-
-        Ok(response)
     }
 }
 

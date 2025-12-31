@@ -23,14 +23,24 @@ async fn main() {
         .init();
 
     // 加载配置
-    let config_path = args.config.unwrap_or_else(|| Config::default_config_path().to_string());
-    let config = Config::load(&config_path).unwrap_or_else(|e| {
+    let config_path = args.config.as_ref()
+        .map(|s| s.as_str())
+        .unwrap_or_else(|| Config::default_config_path());
+    let config = Config::load(config_path).unwrap_or_else(|e| {
         tracing::error!("加载配置失败: {}", e);
         std::process::exit(1);
     });
 
     // 加载凭证
-    let credentials_path = args.credentials.unwrap_or_else(|| KiroCredentials::default_credentials_path().to_string());
+    let credentials_path = args.get_credentials_path().unwrap_or_else(|| {
+        tracing::error!("未指定凭证文件路径，且无法获取默认路径");
+        tracing::error!("请使用 --credentials 参数指定凭证文件路径");
+        tracing::error!("默认路径：~/.aws/sso/cache/kiro-auth-token.json");
+        std::process::exit(1);
+    });
+
+    tracing::info!("使用凭证文件: {}", credentials_path);
+
     let credentials = KiroCredentials::load(&credentials_path).unwrap_or_else(|e| {
         tracing::error!("加载凭证失败: {}", e);
         std::process::exit(1);
@@ -47,13 +57,6 @@ async fn main() {
     // 创建 KiroProvider
     let token_manager = TokenManager::new(config.clone(), credentials.clone());
     let kiro_provider = KiroProvider::new(token_manager);
-
-    // 初始化 count_tokens 配置
-    anthropic::token::init_config(anthropic::token::CountTokensConfig {
-        api_url: config.count_tokens_api_url.clone(),
-        api_key: config.count_tokens_api_key.clone(),
-        auth_type: config.count_tokens_auth_type.clone(),
-    });
 
     // 构建路由（从凭据获取 profile_arn）
     let app = anthropic::create_router_with_provider(&api_key, Some(kiro_provider), credentials.profile_arn.clone());
