@@ -4,6 +4,7 @@
 
 use anyhow::bail;
 use chrono::{DateTime, Duration, Utc};
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
@@ -16,6 +17,8 @@ use crate::model::config::Config;
 pub struct TokenManager {
     config: Config,
     credentials: KiroCredentials,
+    /// 上次刷新时间戳（秒）
+    last_refresh_timestamp: AtomicI64,
 }
 
 impl TokenManager {
@@ -24,6 +27,7 @@ impl TokenManager {
         Self {
             config,
             credentials,
+            last_refresh_timestamp: AtomicI64::new(0),
         }
     }
 
@@ -56,8 +60,33 @@ impl TokenManager {
     ///
     /// 不检查过期时间，直接刷新 Token
     /// 用于认证失败时的重试场景
+    ///
+    /// # 并发控制
+    /// - 如果距离上次刷新不足 5 秒，则跳过刷新，避免频繁调用 OAuth 服务
+    /// - 防止多个并发请求同时触发 token 刷新导致限流
     pub async fn force_refresh_token(&mut self) -> anyhow::Result<String> {
+        let now = Utc::now().timestamp();
+        let last_refresh = self.last_refresh_timestamp.load(Ordering::Relaxed);
+
+        // 如果距离上次刷新不足 5 秒，跳过刷新
+        if now - last_refresh < 5 {
+            tracing::debug!(
+                "距离上次刷新仅 {} 秒，跳过本次刷新以避免频繁请求",
+                now - last_refresh
+            );
+            return self
+                .credentials
+                .access_token
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("没有可用的 accessToken"));
+        }
+
         tracing::info!("强制刷新 Token...");
+
+        // 更新刷新时间戳
+        self.last_refresh_timestamp.store(now, Ordering::Relaxed);
+
+        // 执行刷新
         self.credentials = refresh_token(&self.credentials, &self.config).await?;
 
         self.credentials

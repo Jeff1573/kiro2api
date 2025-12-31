@@ -432,6 +432,12 @@ async fn handle_non_stream_request(
         stop_reason = "tool_use".to_string();
     }
 
+    // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
+    let final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
+
+    // 估算输出 tokens（在 extend 之前）
+    let output_tokens = estimate_output_tokens(&text_content, &tool_uses);
+
     // 构建响应内容
     let mut content: Vec<serde_json::Value> = Vec::new();
 
@@ -444,9 +450,6 @@ async fn handle_non_stream_request(
 
     content.extend(tool_uses);
 
-    // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
-    let final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
-
     // 构建 Anthropic 响应
     let response_body = json!({
         "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
@@ -458,11 +461,64 @@ async fn handle_non_stream_request(
         "stop_sequence": null,
         "usage": {
             "input_tokens": final_input_tokens,
-            "output_tokens": 1
+            "output_tokens": output_tokens
         }
     });
 
     (StatusCode::OK, Json(response_body)).into_response()
+}
+
+/// 估算输出 tokens 数量
+///
+/// 基于文本内容和工具调用估算输出的 token 数量
+fn estimate_output_tokens(text_content: &str, tool_uses: &[serde_json::Value]) -> i32 {
+    // 估算文本内容的 tokens
+    let text_tokens = estimate_tokens(text_content);
+
+    // 估算工具调用的 tokens
+    let tool_tokens: i32 = tool_uses
+        .iter()
+        .map(|tool| {
+            // 工具名称和 ID 的基础 tokens
+            let mut tokens = 10;
+
+            // 估算工具输入参数的 tokens
+            if let Some(input) = tool.get("input") {
+                if let Ok(input_str) = serde_json::to_string(input) {
+                    tokens += estimate_tokens(&input_str);
+                }
+            }
+
+            tokens
+        })
+        .sum();
+
+    (text_tokens + tool_tokens).max(1)
+}
+
+/// 估算文本的 token 数量
+///
+/// 简单估算规则：
+/// - 中文字符：约 1.5 字符/token
+/// - 其他字符（英文等）：约 4 字符/token
+fn estimate_tokens(text: &str) -> i32 {
+    let chars: Vec<char> = text.chars().collect();
+    let mut chinese_count = 0;
+    let mut other_count = 0;
+
+    for c in &chars {
+        if *c >= '\u{4E00}' && *c <= '\u{9FFF}' {
+            chinese_count += 1;
+        } else {
+            other_count += 1;
+        }
+    }
+
+    // 中文约 1.5 字符/token，英文约 4 字符/token
+    let chinese_tokens = (chinese_count * 2 + 2) / 3;
+    let other_tokens = (other_count + 3) / 4;
+
+    (chinese_tokens + other_tokens).max(1)
 }
 
 
