@@ -6,3 +6,5 @@
 /.idea
 /test.json
 /Cargo.lock
+*.exe
+*.env

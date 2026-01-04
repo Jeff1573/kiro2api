@@ -759,6 +759,28 @@ impl StreamContext {
 
         self.state_manager.set_has_tool_use(true);
 
+        // 在 tool_use 开始前，先 flush thinking_buffer 中的剩余内容
+        // 这样可以避免在工具调用时出现消息截断和重复
+        if self.thinking_enabled && !self.thinking_buffer.is_empty() {
+            if self.in_thinking_block {
+                // 如果还在 thinking 块内，发送剩余内容作为 thinking_delta
+                if let Some(thinking_index) = self.thinking_block_index {
+                    events.push(self.create_thinking_delta_event(thinking_index, &self.thinking_buffer));
+                    // 关闭 thinking 块：先发送空的 thinking_delta，再发送 content_block_stop
+                    events.push(self.create_thinking_delta_event(thinking_index, ""));
+                    if let Some(stop_event) = self.state_manager.handle_content_block_stop(thinking_index) {
+                        events.push(stop_event);
+                    }
+                }
+                self.in_thinking_block = false;
+            } else {
+                // 否则发送剩余内容作为 text_delta
+                let buffer_content = self.thinking_buffer.clone();
+                events.extend(self.create_text_delta_events(&buffer_content));
+            }
+            self.thinking_buffer.clear();
+        }
+
         // 获取或分配块索引
         let block_index = if let Some(&idx) = self.tool_block_indices.get(&tool_use.tool_use_id) {
             idx
