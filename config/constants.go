@@ -50,3 +50,21 @@ const (
 	// 用于工具调用参数的JSON内容token估算
 	TokenEstimationRatio = 4
 )
+
+// Extended Thinking 常量
+const (
+	// ThinkingMinBudgetTokens 最小思考预算 token 数
+	ThinkingMinBudgetTokens = 1024
+
+	// ThinkingDefaultBudgetTokens 默认思考预算 token 数
+	ThinkingDefaultBudgetTokens = 10000
+
+	// ThinkingMaxBudgetTokens 最大思考预算 token 数
+	ThinkingMaxBudgetTokens = 128000
+
+	// ThinkingTagOpen thinking 开始标签
+	ThinkingTagOpen = "<thinking>"
+
+	// ThinkingTagClose thinking 结束标签
+	ThinkingTagClose = "</thinking>"
+)
