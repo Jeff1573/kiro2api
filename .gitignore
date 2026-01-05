@@ -36,3 +36,4 @@ auth.json
 .go*
 *.out
 *.exe
+target/*
