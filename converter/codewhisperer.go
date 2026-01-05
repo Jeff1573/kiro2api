@@ -345,7 +345,7 @@ func BuildCodeWhispererRequest(anthropicReq types.AnthropicRequest, ctx *gin.Con
 	}
 
 	// 构建历史消息
-	if len(anthropicReq.System) > 0 || len(anthropicReq.Messages) > 1 || len(anthropicReq.Tools) > 0 || isThinkingEnabled(anthropicReq) {
+	if len(anthropicReq.System) > 0 || len(anthropicReq.Messages) > 1 || len(anthropicReq.Tools) > 0 {
 		var history []any
 
 		// 构建综合系统提示
@@ -360,19 +360,6 @@ func BuildCodeWhispererRequest(anthropicReq types.AnthropicRequest, ctx *gin.Con
 					systemContentBuilder.WriteString("\n")
 				}
 			}
-		}
-
-		// 注入 Extended Thinking 指令
-		if isThinkingEnabled(anthropicReq) {
-			budgetTokens := getThinkingBudgetTokens(anthropicReq)
-			thinkingInstruction := buildThinkingInstruction(budgetTokens)
-			systemContentBuilder.WriteString("\n")
-			systemContentBuilder.WriteString(thinkingInstruction)
-			systemContentBuilder.WriteString("\n")
-
-			logger.Debug("注入 Extended Thinking 指令",
-				logger.Int("budget_tokens", budgetTokens),
-				logger.String("conversation_id", cwReq.ConversationState.ConversationId))
 		}
 
 		// 如果有系统内容，添加到历史记录 (恢复v0.4结构化类型)
@@ -620,44 +607,4 @@ func extractToolUsesFromMessage(content any) []types.ToolUseEntry {
 	}
 
 	return toolUses
-}
-
-// isThinkingEnabled 检查是否启用了 Extended Thinking
-func isThinkingEnabled(req types.AnthropicRequest) bool {
-	return req.Thinking != nil && req.Thinking.Type == "enabled"
-}
-
-// getThinkingBudgetTokens 获取 thinking 预算 token 数
-func getThinkingBudgetTokens(req types.AnthropicRequest) int {
-	if req.Thinking == nil || req.Thinking.BudgetTokens <= 0 {
-		return config.ThinkingDefaultBudgetTokens
-	}
-
-	budgetTokens := req.Thinking.BudgetTokens
-
-	// 限制在有效范围内
-	if budgetTokens < config.ThinkingMinBudgetTokens {
-		budgetTokens = config.ThinkingMinBudgetTokens
-	}
-	if budgetTokens > config.ThinkingMaxBudgetTokens {
-		budgetTokens = config.ThinkingMaxBudgetTokens
-	}
-
-	return budgetTokens
-}
-
-// buildThinkingInstruction 构建 thinking 指令
-func buildThinkingInstruction(budgetTokens int) string {
-	return fmt.Sprintf(`<extended_thinking>
-<mode>enabled</mode>
-<budget_tokens>%d</budget_tokens>
-</extended_thinking>
-
-IMPORTANT: Before providing your response, you MUST first think through the problem step by step inside <thinking>...</thinking> tags. This thinking process should:
-- Analyze the question or task carefully
-- Consider different approaches or perspectives
-- Work through any reasoning or calculations
-- Identify potential issues or edge cases
-
-After your thinking, provide your actual response outside the thinking tags. The thinking section helps ensure thorough and accurate responses.`, budgetTokens)
 }

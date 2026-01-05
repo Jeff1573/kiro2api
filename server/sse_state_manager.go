@@ -11,7 +11,7 @@ import (
 // BlockState 内容块状态
 type BlockState struct {
 	Index     int    `json:"index"`
-	Type      string `json:"type"` // "text" | "tool_use" | "thinking"
+	Type      string `json:"type"` // "text" | "tool_use"
 	Started   bool   `json:"started"`
 	Stopped   bool   `json:"stopped"`
 	ToolUseID string `json:"tool_use_id,omitempty"` // 仅用于工具块
@@ -225,11 +225,8 @@ func (ssm *SSEStateManager) handleContentBlockDelta(c *gin.Context, sender Strea
 		blockType := "text" // 默认为文本块
 		if delta, ok := eventData["delta"].(map[string]any); ok {
 			if deltaType, ok := delta["type"].(string); ok {
-				switch deltaType {
-				case "input_json_delta":
+				if deltaType == "input_json_delta" {
 					blockType = "tool_use"
-				case "thinking_delta":
-					blockType = "thinking"
 				}
 			}
 		}
@@ -246,8 +243,6 @@ func (ssm *SSEStateManager) handleContentBlockDelta(c *gin.Context, sender Strea
 		switch blockType {
 		case "text":
 			startEvent["content_block"].(map[string]any)["text"] = ""
-		case "thinking":
-			startEvent["content_block"].(map[string]any)["thinking"] = ""
 		case "tool_use":
 			// 为工具使用块添加必要字段
 			startEvent["content_block"].(map[string]any)["id"] = fmt.Sprintf("tooluse_auto_%d", index)

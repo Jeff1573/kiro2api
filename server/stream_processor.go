@@ -41,15 +41,11 @@ type StreamProcessorContext struct {
 	// 工具调用跟踪
 	toolUseIdByBlockIndex map[int]string
 	completedToolUseIds   map[string]bool // 已完成的工具ID集合（用于stop_reason判断）
-
+	
 	// *** 新增：JSON字节累加器（修复分段整除精度损失） ***
 	// 问题：每个 input_json_delta 单独计算 len(partialJSON)/4 会导致小于4字节的分段被舍弃
 	// 解决：累加每个块的JSON字节数，在 content_block_stop 时一次性计算 token
 	jsonBytesByBlockIndex map[int]int // 每个工具块累积的JSON字节数
-
-	// Extended Thinking 支持
-	thinkingEnabled bool            // 是否启用 thinking
-	thinkingParser  *ThinkingParser // thinking 标签解析器
 }
 
 // NewStreamProcessorContext 创建流处理上下文
@@ -61,10 +57,7 @@ func NewStreamProcessorContext(
 	messageID string,
 	inputTokens int,
 ) *StreamProcessorContext {
-	// 检查是否启用 thinking
-	thinkingEnabled := req.Thinking != nil && req.Thinking.Type == "enabled"
-
-	ctx := &StreamProcessorContext{
+	return &StreamProcessorContext{
 		c:                     c,
 		req:                   req,
 		token:                 token,
@@ -77,18 +70,8 @@ func NewStreamProcessorContext(
 		compliantParser:       parser.NewCompliantEventStreamParser(),
 		toolUseIdByBlockIndex: make(map[int]string),
 		completedToolUseIds:   make(map[string]bool),
-		jsonBytesByBlockIndex: make(map[int]int),
-		thinkingEnabled:       thinkingEnabled,
+		jsonBytesByBlockIndex: make(map[int]int), // *** 初始化JSON字节累加器 ***
 	}
-
-	// 如果启用 thinking，创建解析器
-	if thinkingEnabled {
-		ctx.thinkingParser = NewThinkingParser()
-		logger.Debug("Extended Thinking 已启用",
-			logger.String("message_id", messageID))
-	}
-
-	return ctx
 }
 
 // Cleanup 清理资源
@@ -97,12 +80,6 @@ func (ctx *StreamProcessorContext) Cleanup() {
 	// 重置解析器状态
 	if ctx.compliantParser != nil {
 		ctx.compliantParser.Reset()
-	}
-
-	// 清理 thinking 解析器
-	if ctx.thinkingParser != nil {
-		ctx.thinkingParser.Reset()
-		ctx.thinkingParser = nil
 	}
 
 	// 清理工具调用映射
@@ -406,40 +383,13 @@ func (esp *EventStreamProcessor) processEvent(event parser.SSEEvent) error {
 	// 处理不同类型的事件
 	switch eventType {
 	case "content_block_start":
-		// 如果启用了 thinking，拦截上游的 text 块事件
-		// 由 thinking 处理器统一管理块的生命周期
-		if esp.ctx.thinkingEnabled && esp.ctx.thinkingParser != nil {
-			if contentBlock, ok := dataMap["content_block"].(map[string]any); ok {
-				if blockType, _ := contentBlock["type"].(string); blockType == "text" {
-					logger.Debug("thinking 模式：拦截上游 text content_block_start")
-					return nil // 不转发，由 thinking 处理器管理
-				}
-			}
-		}
 		esp.ctx.processToolUseStart(dataMap)
 
 	case "content_block_delta":
-		// 如果启用了 thinking，需要解析 <thinking> 标签
-		if esp.ctx.thinkingEnabled && esp.ctx.thinkingParser != nil {
-			if handled := esp.processThinkingDelta(dataMap); handled {
-				return nil // thinking 处理器已处理，不转发原始事件
-			}
-		}
+		// 直传：不做聚合
+		// 但需要统计输出字符数（在后面统一处理）
 
 	case "content_block_stop":
-		// 如果启用了 thinking，拦截上游的 text 块 stop 事件
-		if esp.ctx.thinkingEnabled && esp.ctx.thinkingParser != nil {
-			index := extractIndex(dataMap)
-			// 拦截 index 0 和 1 的 stop 事件（thinking 和 text 块）
-			// 由 thinking 处理器在适当时机发送
-			if index == 0 || index == 1 {
-				logger.Debug("thinking 模式：拦截上游 content_block_stop",
-					logger.Int("index", index))
-				// 确保 thinking 块正确关闭
-				esp.finalizeThinkingBlock()
-				return nil
-			}
-		}
 		esp.ctx.processToolUseStop(dataMap)
 
 	case "message_delta":
@@ -463,199 +413,56 @@ func (esp *EventStreamProcessor) processEvent(event parser.SSEEvent) error {
 	// 1. 计费准确性：客户端消费的是实际内容，而不是事件结构
 	// 2. 一致性：与非流式响应的 token 计算逻辑保持一致
 	// 3. 符合 Claude 官方计费规则：只计算内容 token，不计算结构开销
-	// 注意：thinking 模式下的 token 统计在 sendThinkingDelta/sendTextDelta 中处理
-	if !esp.ctx.thinkingEnabled {
-		switch eventType {
-		case "content_block_delta":
-			// 内容增量事件：累计实际文本或 JSON 内容的 token
-			if delta, ok := dataMap["delta"].(map[string]any); ok {
-				deltaType, _ := delta["type"].(string)
-
-				switch deltaType {
-				case "text_delta":
-					// 文本内容增量
-					if text, ok := delta["text"].(string); ok {
-						esp.ctx.totalOutputTokens += esp.ctx.tokenEstimator.EstimateTextTokens(text)
-					}
-
-				case "input_json_delta":
-					// *** 修复：累加JSON字节数，延迟到content_block_stop时统一计算 ***
-					// 问题：分段整除导致精度损失（例如 3字节/4=0, 2字节/4=0）
-					// 解决：累加所有分段的字节数，在块结束时一次性计算 token
-					if partialJSON, ok := delta["partial_json"].(string); ok {
-						index := extractIndex(dataMap)
-						esp.ctx.jsonBytesByBlockIndex[index] += len(partialJSON)
-					}
+	switch eventType {
+	case "content_block_delta":
+		// 内容增量事件：累计实际文本或 JSON 内容的 token
+		if delta, ok := dataMap["delta"].(map[string]any); ok {
+			deltaType, _ := delta["type"].(string)
+			
+			switch deltaType {
+			case "text_delta":
+				// 文本内容增量
+				if text, ok := delta["text"].(string); ok {
+					esp.ctx.totalOutputTokens += esp.ctx.tokenEstimator.EstimateTextTokens(text)
 				}
-			}
-
-		case "content_block_start":
-			// 内容块开始事件：累计结构性 token
-			// 根据 Claude 官方文档，tool_use 块的结构字段（type, id, name）也会消耗 token
-			if contentBlock, ok := dataMap["content_block"].(map[string]any); ok {
-				blockType, _ := contentBlock["type"].(string)
-
-				if blockType == "tool_use" {
-					// 工具调用结构开销：
-					// - "type": "tool_use" ≈ 3 tokens
-					// - "id": "toolu_xxx" ≈ 8 tokens
-					// - "name" 关键字 ≈ 1 token
-					// - 工具名称本身的 token（使用 estimateToolName 计算）
-					esp.ctx.totalOutputTokens += 12 // 结构字段固定开销
-
-					if toolName, ok := contentBlock["name"].(string); ok {
-						esp.ctx.totalOutputTokens += esp.ctx.tokenEstimator.EstimateTextTokens(toolName)
-					}
+			
+			case "input_json_delta":
+				// *** 修复：累加JSON字节数，延迟到content_block_stop时统一计算 ***
+				// 问题：分段整除导致精度损失（例如 3字节/4=0, 2字节/4=0）
+				// 解决：累加所有分段的字节数，在块结束时一次性计算 token
+				if partialJSON, ok := delta["partial_json"].(string); ok {
+					index := extractIndex(dataMap)
+					esp.ctx.jsonBytesByBlockIndex[index] += len(partialJSON)
 				}
 			}
 		}
+	
+	case "content_block_start":
+		// 内容块开始事件：累计结构性 token
+		// 根据 Claude 官方文档，tool_use 块的结构字段（type, id, name）也会消耗 token
+		if contentBlock, ok := dataMap["content_block"].(map[string]any); ok {
+			blockType, _ := contentBlock["type"].(string)
+			
+			if blockType == "tool_use" {
+				// 工具调用结构开销：
+				// - "type": "tool_use" ≈ 3 tokens
+				// - "id": "toolu_xxx" ≈ 8 tokens  
+				// - "name" 关键字 ≈ 1 token
+				// - 工具名称本身的 token（使用 estimateToolName 计算）
+				esp.ctx.totalOutputTokens += 12 // 结构字段固定开销
+				
+				if toolName, ok := contentBlock["name"].(string); ok {
+					esp.ctx.totalOutputTokens += esp.ctx.tokenEstimator.EstimateTextTokens(toolName)
+				}
+			}
+		}
+	
+	// 其他事件类型（message_start, content_block_stop, message_delta, message_stop 等）
+	// 不包含实际内容，不累计 token
 	}
 
 	esp.ctx.c.Writer.Flush()
 	return nil
-}
-
-// processThinkingDelta 处理 thinking 标签解析
-// 返回 true 表示已处理，不需要转发原始事件
-func (esp *EventStreamProcessor) processThinkingDelta(dataMap map[string]any) bool {
-	delta, ok := dataMap["delta"].(map[string]any)
-	if !ok {
-		return false
-	}
-
-	deltaType, _ := delta["type"].(string)
-	if deltaType != "text_delta" {
-		return false
-	}
-
-	text, ok := delta["text"].(string)
-	if !ok || text == "" {
-		return false
-	}
-
-	// 解析文本，分离 thinking 和正文
-	result := esp.ctx.thinkingParser.Parse(text)
-
-	// 处理 thinking 开始
-	if result.ThinkingStart && !esp.ctx.thinkingParser.IsThinkingStarted() {
-		esp.sendThinkingBlockStart()
-		esp.ctx.thinkingParser.SetThinkingStarted()
-	}
-
-	// 发送 thinking 内容
-	if result.ThinkingContent != "" {
-		esp.sendThinkingDelta(result.ThinkingContent)
-	}
-
-	// 处理 thinking 结束
-	if result.ThinkingEnd && !esp.ctx.thinkingParser.IsThinkingStopped() {
-		esp.sendThinkingBlockStop()
-		esp.ctx.thinkingParser.SetThinkingStopped()
-	}
-
-	// 发送正文内容
-	if result.TextContent != "" {
-		// 如果 text 块还没开始，先发送 text block start
-		if !esp.ctx.thinkingParser.IsTextStarted() {
-			esp.sendTextBlockStart()
-			esp.ctx.thinkingParser.SetTextStarted()
-		}
-		esp.sendTextDelta(result.TextContent)
-	}
-
-	// 返回 true 表示已处理，不需要转发原始事件
-	return true
-}
-
-// finalizeThinkingBlock 在 content_block_stop 时确保 thinking 块正确关闭
-func (esp *EventStreamProcessor) finalizeThinkingBlock() {
-	// 如果 thinking 已开始但未结束，强制关闭
-	if esp.ctx.thinkingParser.IsThinkingStarted() && !esp.ctx.thinkingParser.IsThinkingStopped() {
-		esp.sendThinkingBlockStop()
-		esp.ctx.thinkingParser.SetThinkingStopped()
-	}
-}
-
-// sendThinkingBlockStart 发送 thinking 块开始事件
-func (esp *EventStreamProcessor) sendThinkingBlockStart() {
-	event := map[string]any{
-		"type":  "content_block_start",
-		"index": 0,
-		"content_block": map[string]any{
-			"type":     "thinking",
-			"thinking": "",
-		},
-	}
-	if err := esp.ctx.sseStateManager.SendEvent(esp.ctx.c, esp.ctx.sender, event); err != nil {
-		logger.Error("发送 thinking block start 失败", logger.Err(err))
-	}
-	esp.ctx.c.Writer.Flush()
-}
-
-// sendThinkingDelta 发送 thinking 内容增量
-func (esp *EventStreamProcessor) sendThinkingDelta(thinking string) {
-	event := map[string]any{
-		"type":  "content_block_delta",
-		"index": 0,
-		"delta": map[string]any{
-			"type":     "thinking_delta",
-			"thinking": thinking,
-		},
-	}
-	if err := esp.ctx.sseStateManager.SendEvent(esp.ctx.c, esp.ctx.sender, event); err != nil {
-		logger.Error("发送 thinking delta 失败", logger.Err(err))
-	}
-	esp.ctx.c.Writer.Flush()
-
-	// 统计 thinking token
-	esp.ctx.totalOutputTokens += esp.ctx.tokenEstimator.EstimateTextTokens(thinking)
-}
-
-// sendThinkingBlockStop 发送 thinking 块结束事件
-func (esp *EventStreamProcessor) sendThinkingBlockStop() {
-	event := map[string]any{
-		"type":  "content_block_stop",
-		"index": 0,
-	}
-	if err := esp.ctx.sseStateManager.SendEvent(esp.ctx.c, esp.ctx.sender, event); err != nil {
-		logger.Error("发送 thinking block stop 失败", logger.Err(err))
-	}
-	esp.ctx.c.Writer.Flush()
-}
-
-// sendTextBlockStart 发送 text 块开始事件
-func (esp *EventStreamProcessor) sendTextBlockStart() {
-	event := map[string]any{
-		"type":  "content_block_start",
-		"index": 1, // thinking 是 index 0，text 是 index 1
-		"content_block": map[string]any{
-			"type": "text",
-			"text": "",
-		},
-	}
-	if err := esp.ctx.sseStateManager.SendEvent(esp.ctx.c, esp.ctx.sender, event); err != nil {
-		logger.Error("发送 text block start 失败", logger.Err(err))
-	}
-	esp.ctx.c.Writer.Flush()
-}
-
-// sendTextDelta 发送 text 内容增量
-func (esp *EventStreamProcessor) sendTextDelta(text string) {
-	event := map[string]any{
-		"type":  "content_block_delta",
-		"index": 1, // text 块的索引
-		"delta": map[string]any{
-			"type": "text_delta",
-			"text": text,
-		},
-	}
-	if err := esp.ctx.sseStateManager.SendEvent(esp.ctx.c, esp.ctx.sender, event); err != nil {
-		logger.Error("发送 text delta 失败", logger.Err(err))
-	}
-	esp.ctx.c.Writer.Flush()
-
-	// 统计 text token
-	esp.ctx.totalOutputTokens += esp.ctx.tokenEstimator.EstimateTextTokens(text)
 }
 
 // processContentBlockDelta 处理content_block_delta事件
